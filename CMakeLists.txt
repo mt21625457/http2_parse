@@ -103,3 +103,15 @@ enable_testing()
 add_test(NAME http2_parse_tests COMMAND http2_parse_test)
 
 
+# --- Examples ---
+if(NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
+    add_executable(serialize_request examples/serialize_request.cpp)
+    target_link_libraries(serialize_request PRIVATE http2_parse)
+    target_include_directories(serialize_request PRIVATE src)
+
+    add_executable(parse_request examples/parse_request.cpp)
+    target_link_libraries(parse_request PRIVATE http2_parse)
+    target_include_directories(parse_request PRIVATE src)
+endif()
+
+

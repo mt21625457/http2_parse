@@ -29,25 +29,24 @@ std::vector<std::byte> construct_frame(uint32_t length, FrameType type, uint8_t 
     return frame_bytes;
 }
 
-
 class Http2ParserTest : public ::testing::Test {
-protected:
-    // HpackDecoder and Http2Connection are dependencies for Http2Parser
-    HpackDecoder hpack_decoder;
-    Http2Connection connection_context; // True for server, false for client
-    Http2Parser parser;
-
-    std::vector<AnyHttp2Frame> parsed_frames_store;
-    ParserError last_parser_error_ = ParserError::OK;
-
+public:
     Http2ParserTest() : connection_context(true /*is_server*/), parser(hpack_decoder, connection_context) {
-        parser.set_raw_frame_parsed_callback([this](AnyHttp2Frame frame){
+        parser.set_frame_callback([this](AnyHttp2Frame frame, const std::vector<std::byte>& payload){
             parsed_frames_store.push_back(std::move(frame));
         });
         // Set a reasonable max frame size for tests, e.g., default
         connection_context.apply_local_setting({http2::SettingsFrame::SETTINGS_MAX_FRAME_SIZE, DEFAULT_MAX_FRAME_SIZE});
         connection_context.apply_remote_setting({http2::SettingsFrame::SETTINGS_MAX_FRAME_SIZE, DEFAULT_MAX_FRAME_SIZE});
     }
+
+protected:
+    HpackDecoder hpack_decoder;
+    // For parser tests, we can use the real connection object.
+    Http2Connection connection_context;
+    Http2Parser parser;
+    std::vector<AnyHttp2Frame> parsed_frames_store;
+    ParserError last_parser_error_ = ParserError::OK;
 
     void SetUp() override {
         parsed_frames_store.clear();

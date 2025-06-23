@@ -34,9 +34,9 @@ Http2Connection::Http2Connection(bool is_server_connection)
       remote_connection_window_size_(DEFAULT_INITIAL_WINDOW_SIZE),
       expected_continuation_stream_id_(std::nullopt)
        {
-    // The parser is instantiated here, needs HpackDecoder and this connection context
     parser_ = std::make_unique<Http2Parser>(hpack_decoder_, *this);
-    parser_->set_raw_frame_parsed_callback([this](AnyHttp2Frame frame){
+    parser_->set_frame_callback([this](AnyHttp2Frame frame, const std::vector<std::byte>& payload){
+        // The `payload` argument is ignored for now, but is required by the new callback signature.
         this->handle_parsed_frame(std::move(frame));
     });
 

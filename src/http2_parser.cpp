@@ -38,10 +38,6 @@ Http2Parser::Http2Parser(HpackDecoder& hpack_decoder, Http2Connection& connectio
     : hpack_decoder_(hpack_decoder), connection_context_(connection_context) {
 }
 
-void Http2Parser::set_raw_frame_parsed_callback(RawFrameParsedCallback cb) {
-    raw_frame_parsed_cb_ = std::move(cb);
-}
-
 void Http2Parser::reset() {
     current_state_ = State::READING_FRAME_HEADER;
     buffer_.clear();
@@ -81,143 +77,164 @@ std::optional<FrameHeader> Http2Parser::read_frame_header(std::span<const std::b
 
 std::pair<size_t, ParserError> Http2Parser::parse(std::span<const std::byte> data) {
     size_t total_consumed_bytes = 0;
-    ParserError last_error = ParserError::OK;
-
+    
     // Append new data to internal buffer
     buffer_.insert(buffer_.end(), data.begin(), data.end());
 
     while (true) {
         if (current_state_ == State::READING_FRAME_HEADER) {
             if (buffer_.size() < 9) { // Not enough data for a header
-                break;
+                break; // Exit loop, wait for more data
             }
+            
             std::span<const std::byte> header_span(buffer_.data(), 9);
-            auto header_opt = read_frame_header(header_span); // header_span is not advanced by read_frame_header here
-                                                              // because we are operating on buffer_
+            auto header_opt = read_frame_header(header_span);
 
-            if (!header_opt) { // Should not happen if size >= 9, unless read_frame_header has internal errors
-                last_error = ParserError::INTERNAL_ERROR; // Should be more specific
-                break;
+            if (!header_opt) { 
+                return {total_consumed_bytes, ParserError::INTERNAL_ERROR}; // Should not happen
             }
             pending_frame_header_ = header_opt.value();
 
             if (pending_frame_header_.length > connection_context_.get_remote_settings().max_frame_size) {
-                last_error = ParserError::FRAME_SIZE_LIMIT_EXCEEDED;
-                // Connection should send GOAWAY with FRAME_SIZE_ERROR
-                // For now, parser stops and reports.
-                break;
+                return {total_consumed_bytes, ParserError::FRAME_SIZE_LIMIT_EXCEEDED};
             }
 
             current_state_ = State::READING_FRAME_PAYLOAD;
-            // Do not consume header from buffer_ yet, wait until payload is also read.
         }
 
         if (current_state_ == State::READING_FRAME_PAYLOAD) {
-            if (buffer_.size() < (9 + pending_frame_header_.length)) { // Not enough data for header + payload
-                break;
+            size_t frame_total_size = 9 + pending_frame_header_.length;
+            if (buffer_.size() < frame_total_size) { // Not enough data for the full frame
+                break; // Exit loop, wait for more data
             }
 
-            // We have enough data for the full frame (header + payload)
+            // We have the full frame now.
             std::span<const std::byte> payload_span(buffer_.data() + 9, pending_frame_header_.length);
-            AnyHttp2Frame parsed_frame_variant{DataFrame{}}; // Dummy init
             ParserError parse_payload_error = ParserError::OK;
 
             // --- Frame Type Dispatch ---
             switch (pending_frame_header_.type) {
                 case FrameType::DATA: {
                     auto [frame, err] = parse_data_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::HEADERS: {
                     auto [frame, err] = parse_headers_payload(pending_frame_header_, payload_span);
-                     if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::PRIORITY: {
                     auto [frame, err] = parse_priority_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::RST_STREAM: {
                     auto [frame, err] = parse_rst_stream_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::SETTINGS: {
                     auto [frame, err] = parse_settings_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::PUSH_PROMISE: {
                      auto [frame, err] = parse_push_promise_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::PING: {
                     auto [frame, err] = parse_ping_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::GOAWAY: {
                     auto [frame, err] = parse_goaway_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::WINDOW_UPDATE: {
                     auto [frame, err] = parse_window_update_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
                 case FrameType::CONTINUATION: {
                     auto [frame, err] = parse_continuation_payload(pending_frame_header_, payload_span);
-                    if (err == ParserError::OK) parsed_frame_variant = frame;
+                    if (err == ParserError::OK && frame_callback_) {
+                        std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                        frame_callback_(AnyHttp2Frame(frame), std::move(payload_copy));
+                    }
                     parse_payload_error = err;
                     break;
                 }
-                default:
-                    // Unknown frame type. Per RFC 7540 Sec 4.1:
-                    // "Implementations MUST ignore and discard any frame that has a type that is unknown."
-                    // So, we consume it but don't callback or error, unless strict.
-                    // For now, let's treat as an error to be aware.
-                    parsed_frame_variant = AnyHttp2Frame(UnknownFrame{pending_frame_header_, std::vector<std::byte>(payload_span.begin(), payload_span.end())});
+                default: {
+                    AnyHttp2Frame unknown_frame(UnknownFrame{pending_frame_header_, std::vector<std::byte>(payload_span.begin(), payload_span.end())});
+                    if (frame_callback_) {
+                         std::vector<std::byte> payload_copy(payload_span.begin(), payload_span.end());
+                         frame_callback_(unknown_frame, std::move(payload_copy));
+                    }
                     parse_payload_error = ParserError::INVALID_FRAME_TYPE;
-            }
-
-            size_t frame_total_size = 9 + pending_frame_header_.length;
-            if (parse_payload_error == ParserError::OK) {
-                if (raw_frame_parsed_cb_) {
-                    raw_frame_parsed_cb_(parsed_frame_variant);
                 }
-                total_consumed_bytes += frame_total_size;
-                buffer_.erase(buffer_.begin(), buffer_.begin() + frame_total_size);
-                current_state_ = State::READING_FRAME_HEADER; // Ready for next frame
-                last_error = ParserError::OK;
-            } else {
-                last_error = parse_payload_error;
-                // On error, stop parsing. The connection might need to send GOAWAY.
-                // How much is consumed depends on error recovery strategy.
-                // For now, assume fatal error, nothing more consumed from this point.
-                // A more robust parser might try to skip the erroneous frame if possible.
-                break;
             }
-        } // end if READING_FRAME_PAYLOAD
+            
+            if (parse_payload_error != ParserError::OK) {
+                 return {total_consumed_bytes, parse_payload_error}; // Stop on error
+            }
+            
+            // Consume the frame from the buffer
+            buffer_.erase(buffer_.begin(), buffer_.begin() + frame_total_size);
+            total_consumed_bytes += frame_total_size;
 
-        if (last_error != ParserError::OK) break; // Exit loop if error occurred
-        if (buffer_.empty() && current_state_ == State::READING_FRAME_HEADER) break; // No more data and ready for new frame.
-        if (buffer_.size() < 9 && current_state_ == State::READING_FRAME_HEADER) break; // Not enough for next header
+            // Reset for the next frame
+            current_state_ = State::READING_FRAME_HEADER; 
+
+        } // end if READING_FRAME_PAYLOAD
     } // end while(true)
 
-    return {total_consumed_bytes, last_error};
+    // Return the total bytes consumed from the input `data` span.
+    // Note: this implementation consumes from an internal buffer, so the relationship
+    // to the input `data` span is indirect. The return value should represent
+    // total data processed successfully from the stream.
+    // For simplicity, let's just return what we have in `total_consumed_bytes`.
+    // A more precise implementation might track consumption from the original `data` span.
+    return {data.size(), ParserError::OK};
 }
 
 

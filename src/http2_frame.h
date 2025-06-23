@@ -57,7 +57,7 @@ struct HeadersFrame {
     std::optional<uint8_t> weight;
 
     std::vector<HttpHeader> headers; // Decoded headers
-    // Raw header block fragment is processed by HPACK decoder
+    std::vector<std::byte> header_block_fragment; // Raw HPACK data
 
     bool has_end_stream_flag() const { return header.flags & END_STREAM_FLAG; }
     bool has_end_headers_flag() const { return header.flags & END_HEADERS_FLAG; }

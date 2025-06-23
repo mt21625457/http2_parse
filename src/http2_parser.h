@@ -42,12 +42,11 @@ public:
     // The Http2Connection (or a similar higher-level component) would then interpret this AnyHttp2Frame
     // and invoke semantic callbacks.
     // However, the parser might have a callback for when a complete frame is parsed.
-    using RawFrameParsedCallback = std::function<void(AnyHttp2Frame frame)>;
+    using FrameCallback = std::function<void(AnyHttp2Frame, std::vector<std::byte>)>;
 
     // The parser needs access to the HPACK decoder, which is typically managed by the connection
     // due to its statefulness and SETTINGS_HEADER_TABLE_SIZE updates.
     Http2Parser(HpackDecoder& hpack_decoder, Http2Connection& connection_context);
-
 
     // Parses a chunk of incoming data.
     // Returns the number of bytes consumed from the input span.
@@ -56,12 +55,11 @@ public:
     // For now, let's use a pair: <bytes_consumed, ParserError>
     std::pair<size_t, ParserError> parse(std::span<const std::byte> data);
 
-    void set_raw_frame_parsed_callback(RawFrameParsedCallback cb);
+    void set_frame_callback(FrameCallback cb) { frame_callback_ = std::move(cb); }
 
     // Resets parser state, e.g., if the connection is reset.
     // Does not reset HPACK decoder state, as that's managed by Http2Connection.
     void reset();
-
 
 private:
     // Internal parsing state
@@ -82,8 +80,7 @@ private:
     // and for handling CONTINUATION logic across frames.
     Http2Connection& connection_context_;
 
-
-    RawFrameParsedCallback raw_frame_parsed_cb_;
+    FrameCallback frame_callback_;
 
     // --- Frame-specific parsing functions ---
     // These take a span of the payload data and the frame header.
@@ -103,7 +100,6 @@ private:
     std::pair<AnyHttp2Frame, ParserError> parse_window_update_payload(const FrameHeader& header, std::span<const std::byte> payload);
     std::pair<AnyHttp2Frame, ParserError> parse_continuation_payload(const FrameHeader& header, std::span<const std::byte> payload);
     std::pair<AnyHttp2Frame, ParserError> parse_unknown_payload(const FrameHeader& header, std::span<const std::byte> payload);
-
 
     // Helper to read the 9-byte frame header
     std::optional<FrameHeader> read_frame_header(std::span<const std::byte>& data);
