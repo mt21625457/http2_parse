@@ -148,53 +148,15 @@ std::pair<std::vector<std::byte>, HpackEncodingError> HpackEncoder::encode(const
 
 void HpackEncoder::set_peer_max_dynamic_table_size(uint32_t max_size) {
     peer_max_dynamic_table_size_ = max_size;
-    // This might influence encoding choices, e.g., whether to use "With Incremental Indexing"
-    // if the entry might not fit in the peer's table. For now, not strictly enforced here,
-    // as the primary constraint is our *own* table size for adding entries.
-    // However, the encoder MUST NOT cause the dynamic table capacity to exceed this value.
-    // This means if peer_max_dynamic_table_size_ is smaller than our intended additions,
-    // we should use non-indexing or never-indexed literals.
-    // The current logic in `encode` primarily considers `own_max_dynamic_table_size_` for additions.
-    // A stricter implementation would also check against `peer_max_dynamic_table_size_`
-    // before choosing "Literal With Incremental Indexing".
-    // For now, this mainly informs the context, but `encode` logic needs to be aware.
 }
 
 bool HpackEncoder::set_own_max_dynamic_table_size(uint32_t max_size) {
-    // This is called when we intend to change our dynamic table size,
-    // typically by sending a SETTINGS_HEADER_TABLE_SIZE.
-    // The actual change to `own_max_dynamic_table_size_` and eviction
-    // should happen *after* the peer acknowledges this size via its own
-    // SETTINGS frame (or if we send a Dynamic Table Size Update instruction in HPACK).
-    // For now, this method will set the intended size and evict immediately.
-    // A more compliant model would be:
-    // 1. Application calls this to set *intended* max size.
-    // 2. Connection sends SETTINGS frame with this new size.
-    // 3. Encoder *could* preemptively evict entries to meet this new *intended* size,
-    //    OR it waits for peer's ACK.
-    // 4. RFC 7541 Section 4.2: "This mechanism can be used to completely clear
-    //    the dynamic table by setting a maximum size of 0, which can be
-    //    followed by a maximum size update to a larger value."
-    //
-    // This method will also determine if a Dynamic Table Size Update *instruction*
-    // needs to be encoded in the next HPACK block.
-    // For now, simpler: update own_max_dynamic_table_size_ and evict.
-    // The return value indicates if a SETTINGS frame should reflect this change.
-
     bool size_changed_for_settings = (own_max_dynamic_table_size_ != max_size);
 
     own_max_dynamic_table_size_ = max_size;
     evict_from_dynamic_table(0); // Evict until current_size <= new max_size
 
-    // The need to send an HPACK dynamic table size update instruction (001xxxxx)
-    // is if `max_size` is less than `own_max_dynamic_table_size_acknowledged_by_peer_`.
-    // If we increase the size, we just start using it up to the new max, and peer learns via SETTINGS.
-    // If we decrease it below what peer thinks we have, we MUST signal this via HPACK instruction.
-    // This logic is complex and usually part of `encode()` beginning.
-    // For now, `set_own_max_dynamic_table_size` directly applies the size.
-    // The `own_max_dynamic_table_size_acknowledged_by_peer_` would be updated when we receive SETTINGS ACK for our size.
-
-    return size_changed_for_settings; // Indicates if SETTINGS frame needs to be sent by connection layer.
+    return size_changed_for_settings;
 }
 
 uint32_t HpackEncoder::get_current_dynamic_table_size() const {
@@ -206,7 +168,6 @@ void HpackEncoder::add_to_dynamic_table(const HttpHeader& header) {
     size_t entry_size = header.name.length() + header.value.length() + 32;
 
     if (entry_size > own_max_dynamic_table_size_) {
-        // Entry is too large to ever fit, clear the table
         dynamic_table_.clear();
         current_dynamic_table_size_ = 0;
         return;
@@ -214,8 +175,8 @@ void HpackEncoder::add_to_dynamic_table(const HttpHeader& header) {
 
     evict_from_dynamic_table(static_cast<uint32_t>(entry_size));
 
-    dynamic_table_.push_front({header.name, header.value, entry_size});
-    current_dynamic_table_size_ += static_cast<uint32_t>(entry_size);
+    dynamic_table_.push_front(DynamicTableEntry(header.name, header.value));
+    current_dynamic_table_size_ += static_cast<uint32_t>(dynamic_table_.front().size);
 }
 
 void HpackEncoder::evict_from_dynamic_table(uint32_t required_space) {
@@ -225,43 +186,14 @@ void HpackEncoder::evict_from_dynamic_table(uint32_t required_space) {
     }
 }
 
-std::pair<int, bool> HpackEncoder::find_in_static_table(const HttpHeader& header) {
-    // Returns <absolute_index, value_matches>
-    // Absolute index means 1-61 for static, 62+ for dynamic.
-    // If name not found, index is 0.
-    // If name found but value not, index is for the first name match, value_matches is false.
-
-    // Check static table first
-    auto [static_idx, static_value_match] = Hpack::find_in_static_table(header.name, header.value);
-    if (static_idx != 0) { // Name found in static table
-        return {static_idx, static_value_match};
-    }
-
-    // Check dynamic table
-    // Dynamic table indices are 1-based internally to the dynamic table.
-    // Convert to absolute index by adding static table size.
+std::pair<int, bool> HpackEncoder::find_in_dynamic_table(const HttpHeader& header) {
     for (size_t i = 0; i < dynamic_table_.size(); ++i) {
         if (dynamic_table_[i].name == header.name) {
-            if (dynamic_table_[i].value == header.value) {
-                return {static_cast<int>(Hpack::STATIC_TABLE.size() + i + 1), true}; // Value also matches
-            }
-            // Name matches, value doesn't. Return this as first name match from dynamic table.
-            // (HPACK prefers smallest index for name match if value differs)
-            // If we already found a name match in static table (static_idx != 0 but !static_value_match),
-            // that one would take precedence. But current logic returns early if static_idx !=0.
-            // So, if we are here, name was not in static table.
-            return {static_cast<int>(Hpack::STATIC_TABLE.size() + i + 1), false};
+            bool value_matches = (dynamic_table_[i].value == header.value);
+            return {static_cast<int>(i + 1), value_matches};
         }
     }
-    return {0, false}; // Not found in either table
+    return {0, false}; // No match found
 }
-
-
-// Huffman related methods are in hpack_huffman.cpp / .h
-// bool HpackEncoder::should_use_huffman(const std::string& str, const std::vector<std::byte>& huffman_encoded_str) {
-//     if (huffman_encoded_str.empty() && !str.empty()) return false;
-//     return huffman_encoded_str.size() < str.length();
-// }
-
 
 } // namespace http2

@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  
 
-
+set(TRAGE_BUILD http2_parse)
 
 # Option to build tests, ON by default
 option(HTTP2LIB_BUILD_TESTS "Build the http2lib tests" ON)
@@ -20,6 +20,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
     set(LLVM_INCLUDE_DIR "${LLVM_PATH}/include")
     set(CMAKE_THREAD_LIBS_INIT "-lpthread")
     set(CMAKE_HAVE_THREADS_LIBRARY 1)
+
 
     execute_process(COMMAND
         "xcrun" --show-sdk-path
@@ -57,22 +58,48 @@ set(CMAKE_PREFIX_PATH ${LIBBASE_PATH}/lib/cmake)
 
 find_package(GTest CONFIG REQUIRED)
 
+
+file(GLOB_RECURSE HTTP2LIB_SOURCES 
+    "src/*.cpp"
+    "src/*.h"
+    "src/*.hpp"
+)
 # --- Library ---
 # Add the cpp_lib as a library
 # We'll create a CMakeLists.txt in cpp_lib for its sources
-add_subdirectory(cpp_lib)
+add_library(http2_parse ${HTTP2LIB_SOURCES})
 
 
-# --- Tests ---
-if(HTTP2LIB_BUILD_TESTS)
-  enable_testing() # Enables CTest
-  add_subdirectory(tests)
-  # Example of adding a test executable and linking GoogleTest
-  # This will be detailed in tests/CMakeLists.txt
-  # add_executable(http2_tests ...)
-  # target_link_libraries(http2_tests PRIVATE GTest::gtest GTest::gtest_main http2lib_cpp)
-endif()
+# --- Test Sources ---
+file(GLOB_RECURSE TEST_SOURCES 
+    "tests/*.cpp"
+    "tests/*.h"
+    "tests/*.hpp"
+)
 
-# --- Installation (Optional Example) ---
-# install(TARGETS http2lib_cpp DESTINATION lib)
-# install(DIRECTORY cpp_lib/ DESTINATION include/cpp_lib FILES_MATCHING PATTERN "*.h")
+# --- Test Executable ---
+add_executable(http2_parse_test ${TEST_SOURCES})
+
+# --- Test Dependencies ---
+target_link_libraries(http2_parse_test 
+    PUBLIC
+    http2_parse
+    GTest::gtest
+    GTest::gtest_main
+    http2_parse
+)
+
+# --- Test Include Directories ---
+target_include_directories(http2_parse_test 
+    PRIVATE 
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/tests
+)
+
+
+
+# --- Enable Testing ---
+enable_testing()
+add_test(NAME http2_parse_tests COMMAND http2_parse_test)
+
+

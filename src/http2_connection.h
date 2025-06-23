@@ -20,10 +20,10 @@ class Http2Parser;
 // Default connection settings (RFC 7540 Section 6.5.2)
 constexpr uint32_t DEFAULT_HEADER_TABLE_SIZE = 4096;
 constexpr bool DEFAULT_ENABLE_PUSH = true; // For server; client must not push.
-constexpr uint32_t DEFAULT_MAX_CONCURRENT_STREAMS = 0xFFFFFFFF; // Effectively unlimited initially
+constexpr uint32_t DEFAULT_MAX_CONCURRENT_STREAMS = -1; // No limit
 constexpr uint32_t DEFAULT_INITIAL_WINDOW_SIZE = 65535; // 2^16 - 1
-constexpr uint32_t DEFAULT_MAX_FRAME_SIZE = 16384; // 2^14
-constexpr uint32_t DEFAULT_MAX_HEADER_LIST_SIZE = 0xFFFFFFFF; // Effectively unlimited
+// constexpr uint32_t DEFAULT_MAX_FRAME_SIZE = 16384; // 2^14. This is also defined in http2_types.h
+constexpr uint32_t DEFAULT_MAX_HEADER_LIST_SIZE = -1; // No limit
 
 // Connection state and settings
 struct ConnectionSettings {
@@ -93,9 +93,19 @@ public:
     void record_connection_data_sent(size_t size);
     void record_connection_data_received(size_t size);
 
+    // --- Continuation Handling ---
+    bool is_expecting_continuation() const;
+    stream_id_t get_expected_continuation_stream_id() const;
+    void expect_continuation_for_stream(stream_id_t stream_id, FrameType initiator_type, AnyHttp2Frame initiator_frame);
+    void finish_continuation();
+    void append_to_header_block_buffer(std::span<const std::byte> fragment);
+    void populate_pending_headers(std::vector<HttpHeader> headers);
+    std::span<const std::byte> get_header_block_buffer_span() const;
+    void clear_header_block_buffer();
 
     // --- State Information ---
     bool is_server() const { return is_server_; }
+    bool is_going_away() const { return going_away_; }
     stream_id_t get_next_available_stream_id(); // For client to create new streams
     uint32_t get_max_frame_size_remote() const { return remote_settings_.max_frame_size; }
     uint32_t get_max_frame_size_local() const { return local_settings_.max_frame_size; }
@@ -125,6 +135,8 @@ private:
     stream_id_t next_client_stream_id_ = 1; // For client-initiated streams (odd numbers)
     stream_id_t next_server_stream_id_ = 2; // For server-initiated streams (push promise, even numbers)
     stream_id_t last_processed_stream_id_ = 0; // For GOAWAY processing
+    bool going_away_ = false; // Set to true when GOAWAY has been sent or received
+    stream_id_t last_peer_initiated_stream_id_in_goaway_ = 0;
 
     ConnectionSettings local_settings_;  // Settings we have sent or will send
     ConnectionSettings remote_settings_; // Settings received from the peer

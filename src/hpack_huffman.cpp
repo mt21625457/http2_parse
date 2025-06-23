@@ -184,61 +184,57 @@ std::pair<std::string, HuffmanError> huffman_decode(std::span<const std::byte> i
         initialize_huffman_decode_tree();
     }
 
-    std::string decoded_string;
-    decoded_string.reserve(input.size() * 2); // Pre-allocate, rough estimate
+    std::string output;
+    output.reserve(input.size() * 2); // Pre-allocate, common heuristic
 
     const HuffmanDecodeNode* current_node = HUFFMAN_DECODE_TREE_ROOT_INSTANCE.get();
-    if (!current_node) return { "", HuffmanError::INTERNAL_ERROR}; // Should not happen
+    if (!current_node) return { "", HuffmanError::INVALID_INPUT}; // Should not happen
 
-    int bit_count_in_last_byte = 0; // To track how many bits of the last byte are padding
-
-    for (size_t byte_idx = 0; byte_idx < input.size(); ++byte_idx) {
-        std::byte b = input[byte_idx];
-        for (int bit_idx = 7; bit_idx >= 0; --bit_idx) {
-            if (decoded_string.length() > max_output_length) {
-                return {decoded_string, HuffmanError::BUFFER_TOO_SMALL}; // Output limit exceeded
+    for (const auto& byte : input) {
+        for (int i = 7; i >= 0; --i) {
+            bool bit = (static_cast<uint8_t>(byte) >> i) & 1;
+            
+            if (bit) {
+                current_node = current_node->children[1].get();
+            } else {
+                current_node = current_node->children[0].get();
             }
 
-            int bit = (static_cast<uint8_t>(b) >> bit_idx) & 1;
-            if (!current_node->children[bit]) {
-                 // This sequence of bits does not correspond to any valid Huffman code or EOS prefix.
-                return {decoded_string, HuffmanError::INVALID_INPUT};
+            if (!current_node) {
+                 // This indicates a sequence of bits that does not map to any valid Huffman code.
+                 // It's a protocol error in the compressed data.
+                return { "", HuffmanError::INVALID_INPUT}; // Should not happen with valid input
             }
-            current_node = current_node->children[bit].get();
 
             if (current_node->symbol) {
-                decoded_string += static_cast<char>(current_node->symbol.value());
-                current_node = HUFFMAN_DECODE_TREE_ROOT_INSTANCE.get(); // Reset for next char
-                bit_count_in_last_byte = 0; // Reset padding counter after a full symbol
-            } else {
-                 bit_count_in_last_byte++;
-                 if (byte_idx == input.size() -1 && current_node->is_eos_prefix) {
-                    // We are in the last byte, and the current sequence is a prefix of EOS.
-                    // This is valid padding. We can stop.
-                    // The number of padding bits is (8 - bit_idx) or (7-bit_idx +1)
-                    // The spec requires padding to be the MSBs of EOS.
-                    // If we are on an EOS prefix path, and it's the end of input, it's valid.
-                 } else if (byte_idx == input.size() -1 && !current_node->is_eos_prefix) {
-                    // End of input, current path is not an EOS prefix, and not a full symbol.
-                    return {decoded_string, HuffmanError::INVALID_PADDING};
-                 }
-                 // If not end of input, and not a symbol, just continue.
+                output += static_cast<char>(current_node->symbol.value());
+
+                if (output.length() > max_output_length) {
+                    return { "", HuffmanError::BUFFER_TOO_SMALL };
+                }
+
+                current_node = HUFFMAN_DECODE_TREE_ROOT_INSTANCE.get(); // Reset for the next character
+            } else if (current_node->is_eos_prefix) {
+                // The bit sequence matches a prefix of the EOS. This is only valid
+                // if it's the end of the input stream. We can return here.
+                return { output, HuffmanError::OK };
             }
         }
     }
 
-    // After all bytes are processed, if current_node is not the root,
-    // it means the input ended mid-sequence.
-    // This is valid if the partial sequence is a prefix of the EOS symbol.
+    // After iterating through all bytes, if we are not in a state that represents
+    // the end of a character, it means the code is incomplete.
+    // However, HPACK specifies that padding for the last byte is the prefix of EOS.
+    // If we end up here, it means the last byte was fully consumed without reaching
+    // a terminal symbol and without being an EOS prefix. This is only valid if the
+    // final state is the root, implying an empty input.
+    // A more strict check would be `if (current_node != HUFFMAN_DECODE_TREE_ROOT_INSTANCE.get())`.
+    // The spec implies any non-terminal state at the end is an error.
     if (current_node != HUFFMAN_DECODE_TREE_ROOT_INSTANCE.get()) {
-        if (!current_node->is_eos_prefix) {
-            // The final bits did not form a complete character AND are not a valid EOS prefix.
-            return {decoded_string, HuffmanError::INVALID_PADDING};
-        }
-        // If it IS an EOS prefix, then the padding is valid.
+         return { "", HuffmanError::INCOMPLETE_CODE };
     }
 
-    return {decoded_string, HuffmanError::OK};
+    return { output, HuffmanError::OK };
 }
 
 

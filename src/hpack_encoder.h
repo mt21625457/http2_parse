@@ -78,11 +78,7 @@ private:
     // Dynamic table management
     void add_to_dynamic_table(const HttpHeader& header);
     void evict_from_dynamic_table(uint32_t required_space);
-
-    // Search for matches in static and dynamic tables
-    // Returns <index (0 if no name match), value_matches (bool)>
-    // Index is absolute (1 to 61 for static, 62+ for dynamic)
-    std::pair<int, bool> find_header_in_tables(const HttpHeader& header);
+    std::pair<int, bool> find_in_dynamic_table(const HttpHeader& header);
 
     // --- Placeholder for Huffman Encoding logic ---
     // std::vector<std::byte> huffman_encode(const std::string& str); // In hpack_huffman.h

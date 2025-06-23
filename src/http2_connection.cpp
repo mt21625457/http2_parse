@@ -1,5 +1,6 @@
 #include "http2_connection.h"
 #include "http2_parser.h" // Full definition needed
+#include "http2_frame_serializer.h"
 #include <algorithm> // for std::remove_if for stream cleanup
 #include <iostream> // For debugging
 
@@ -144,12 +145,12 @@ Http2Stream& Http2Connection::get_or_create_stream(stream_id_t stream_id) {
 
         if (is_server_) { // We are the server
             if (client_initiated) { // Client is opening a stream
-                if (stream_id <= last_processed_stream_id_by_client_) {
+                if (stream_id <= last_processed_stream_id_) {
                      // PROTOCOL_ERROR: stream ID less than or equal to previous from client
                      // This requires sending GOAWAY. For now, throw.
                      throw std::runtime_error("PROTOCOL_ERROR: Stream ID regression from client.");
                 }
-                last_processed_stream_id_by_client_ = stream_id;
+                last_processed_stream_id_ = stream_id;
             } else { // Server is trying to create/find a PUSH_PROMISE stream id
                  // This path is usually for finding an existing pushed stream, not initial creation by server here.
                  // Pushed streams are created differently (e.g. `create_pushed_stream`).
@@ -157,10 +158,10 @@ Http2Stream& Http2Connection::get_or_create_stream(stream_id_t stream_id) {
             }
         } else { // We are the client
             if (server_initiated) { // Server is PUSH_PROMISE-ing a stream
-                 if (stream_id <= last_processed_stream_id_by_server_) {
+                 if (stream_id <= last_processed_stream_id_) {
                     throw std::runtime_error("PROTOCOL_ERROR: Stream ID regression from server (PUSH_PROMISE).");
                  }
-                 last_processed_stream_id_by_server_ = stream_id;
+                 last_processed_stream_id_ = stream_id;
             } else { // Client is creating a stream, ID should be from next_client_stream_id_
                 // This is fine.
             }
@@ -419,40 +420,14 @@ void Http2Connection::handle_settings_frame(const SettingsFrame& frame) {
 
     // This is a SETTINGS frame from the peer. Apply them.
     for (const auto& setting : frame.settings) {
-        if (!apply_remote_setting(setting)) { // apply_remote_setting returns false on error
-            // If a setting is invalid, a connection error of type PROTOCOL_ERROR or SETTINGS_TIMEOUT occurs.
-            // For SETTINGS_INITIAL_WINDOW_SIZE > 2^31-1, it's FLOW_CONTROL_ERROR.
-            // Let's assume apply_remote_setting logs specific error for now.
-            // The connection should send GOAWAY.
-             if (on_send_goaway_) {
-                 // Determine appropriate error code based on what apply_remote_setting found
-                 // This part needs more detailed error propagation from apply_remote_setting
-                 ErrorCode err_code = ErrorCode::PROTOCOL_ERROR;
-                 if (setting.identifier == SettingsFrame::SETTINGS_INITIAL_WINDOW_SIZE && setting.value > MAX_ALLOWED_WINDOW_SIZE) {
-                     err_code = ErrorCode::FLOW_CONTROL_ERROR;
-                 }
-                on_send_goaway_(last_processed_stream_id_, err_code, "Invalid SETTINGS parameter");
-            } else {
-                std::cerr << "CONN: Invalid SETTINGS parameter received. Action: GOAWAY(...)" << std::endl;
-            }
-            return; // Stop processing this SETTINGS frame further.
-        }
+        apply_remote_setting(setting);
     }
 
-    // Send SETTINGS ACK frame.
-    if (on_send_settings_ack_) {
-        SettingsFrame ack_frame; // Construct an empty SETTINGS frame with ACK flag
-        ack_frame.header.type = FrameType::SETTINGS;
-        ack_frame.header.flags = SettingsFrame::ACK_FLAG;
-        ack_frame.header.length = 0;
-        ack_frame.header.stream_id = 0;
-        on_send_settings_ack_(ack_frame);
-    } else {
-        std::cerr << "CONN: Would send SETTINGS ACK." << std::endl;
-    }
+    // After applying all settings, send an ACK
+    send_settings_ack_action();
 }
 
-bool Http2Connection::apply_remote_setting(const SettingsFrame::Setting& setting) {
+void Http2Connection::apply_remote_setting(const SettingsFrame::Setting& setting) {
     // Validate and apply settings from the peer. Returns false on error.
     // This updates remote_settings_ and influences connection behavior.
     bool changed_initial_window = false;
@@ -565,26 +540,11 @@ void Http2Connection::handle_ping_frame(const PingFrame& frame) {
 }
 
 void Http2Connection::handle_goaway_frame(const GoAwayFrame& frame) {
-    if (frame.header.stream_id != 0) {
-        // RFC 7540 Section 6.8: "GOAWAY applies to the connection, not a specific stream.
-        // An endpoint MUST treat a GOAWAY frame with a stream identifier other than 0x0
-        // as a connection error (Section 5.4.1) of type PROTOCOL_ERROR."
-        if (on_send_goaway_) {
-            on_send_goaway_(last_processed_stream_id_, ErrorCode::PROTOCOL_ERROR, "GOAWAY frame with non-zero stream ID");
-        } else {
-            std::cerr << "CONN: GOAWAY frame with non-zero stream ID " << frame.header.stream_id << ". Action: GOAWAY(PROTOCOL_ERROR)" << std::endl;
-        }
-        return;
-    }
-
     this->going_away_ = true;
     this->last_peer_initiated_stream_id_in_goaway_ = frame.last_stream_id;
-
     if (goaway_cb_) {
         goaway_cb_(frame);
     }
-    // Connection might be closed after some time or after active streams complete.
-    // Further actions (like closing connection, not creating new streams) depend on application logic.
 }
 
 void Http2Connection::handle_window_update_frame(const WindowUpdateFrame& frame) {
@@ -697,66 +657,30 @@ void Http2Connection::expect_continuation_for_stream(stream_id_t stream_id, Fram
 }
 
 void Http2Connection::finish_continuation() {
-    if (pending_header_initiator_frame_ && frame_cb_) {
-        // The headers should have been populated by populate_pending_headers by now.
-        // Trigger the callback for the completed initiator frame.
-        frame_cb_(*pending_header_initiator_frame_);
-    }
-    expected_continuation_stream_id_ = std::nullopt;
-    header_sequence_initiator_type_ = std::nullopt;
-    pending_header_initiator_frame_ = std::nullopt;
-    // header_block_buffer_ is cleared by the parser after successful decode of the full sequence.
+    expected_continuation_stream_id_.reset();
+    header_sequence_initiator_type_.reset();
+    pending_header_initiator_frame_.reset();
+    clear_header_block_buffer();
 }
 
 void Http2Connection::append_to_header_block_buffer(std::span<const std::byte> fragment) {
     header_block_buffer_.insert(header_block_buffer_.end(), fragment.begin(), fragment.end());
 }
 std::span<const std::byte> Http2Connection::get_header_block_buffer_span() const {
-    return std::span<const std::byte>(header_block_buffer_);
+    return header_block_buffer_;
 }
 void Http2Connection::clear_header_block_buffer() {
     header_block_buffer_.clear();
 }
 
 void Http2Connection::populate_pending_headers(std::vector<HttpHeader> headers) {
-    // This is a bit of a placeholder. The parser, when it completes a header block
-    // (after all CONTINUATIONs), should update the original HEADERS/PUSH_PROMISE
-    // frame object that was created.
-    // This method implies the connection temporarily holds decoded headers.
-    // A cleaner way is for the parser to hold the partial frame and update it.
-    // For now, let's assume the parser has a way to signal the connection
-    // to update the correct stream's understanding of its headers.
-    // This is where the `pending_headers_for_continuation_` (now removed) would have been used.
-    // The current parser directly modifies the HeadersFrame/PushPromiseFrame object if END_HEADERS is set.
-    // If END_HEADERS is on a CONTINUATION, the parser's `parse_continuation_payload`
-    // gets the decoded headers and should ideally pass them back to the connection to
-    // associate with the original stream/frame context.
-
-    // This part of the design needs refinement for how completed headers after CONTINUATIONs
-    // are delivered to the application.
-    // For now, if `handle_headers_frame` is called, `frame.headers` should be complete if
-    // all continuations are processed and END_HEADERS was seen.
-    // if (last_header_frame_pending_continuation_) {
-    //     // This is a conceptual pointer/reference to the HEADERS/PUSH_PROMISE frame
-    //     // that was waiting for these headers.
-    //     // last_header_frame_pending_continuation_->headers = std::move(headers);
-    //     // Then potentially re-trigger its callback or mark it as complete.
-    //     // This is complex to manage correctly here.
-    //     // The parser's current callback model (one per raw frame) makes this tricky.
-    // }
-
-    // New logic: Update the stored initiator frame.
-    if (pending_header_initiator_frame_) {
-        if (header_sequence_initiator_type_ == FrameType::HEADERS) {
-            if (auto* hf = std::get_if<HeadersFrame>(&pending_header_initiator_frame_->frame_variant)) {
-                hf->headers = std::move(headers);
+    if (pending_header_initiator_frame_.has_value()) {
+        std::visit([&](auto& frame_variant){
+            using T = std::decay_t<decltype(frame_variant)>;
+            if constexpr (std::is_same_v<T, HeadersFrame> || std::is_same_v<T, PushPromiseFrame>) {
+                frame_variant.headers = std::move(headers);
             }
-        } else if (header_sequence_initiator_type_ == FrameType::PUSH_PROMISE) {
-            if (auto* ppf = std::get_if<PushPromiseFrame>(&pending_header_initiator_frame_->frame_variant)) {
-                ppf->headers = std::move(headers);
-            }
-        }
-        // The frame is now populated. finish_continuation() will trigger its callback.
+        }, pending_header_initiator_frame_->frame_variant);
     }
 }
 
@@ -780,7 +704,7 @@ void Http2Connection::record_connection_data_sent(size_t size) {
     remote_connection_window_size_ -= static_cast<int32_t>(size);
 }
 void Http2Connection::record_connection_data_received(size_t size) {
-    local_connection_window_size_ -= static_cast<int32_t>(size);
+    local_connection_window_size_ -= size;
 }
 
 const ConnectionSettings& Http2Connection::get_local_settings() const {
@@ -792,63 +716,26 @@ const ConnectionSettings& Http2Connection::get_remote_settings() const {
 
 stream_id_t Http2Connection::get_next_available_stream_id() {
     if (is_server_) {
-        // Server uses even IDs for push promises. This method isn't for that.
-        // Server doesn't initiate request streams.
-        return 0; // Or throw
-    } else {
-        // Client uses odd IDs.
-        stream_id_t id = next_client_stream_id_;
-        if (next_client_stream_id_ > MAX_STREAM_ID - 2) { // Check for overflow before incrementing
-            // No more stream IDs available
-            // TODO: Signal error or connection closure
-            return 0; // Indicate error
-        }
-        next_client_stream_id_ += 2;
-        return id;
+        return 0; // Server does not initiate streams like this
     }
+    if (next_client_stream_id_ > MAX_STREAM_ID - 2) { // Check for overflow before incrementing
+        return 0; // No more stream IDs available
+    }
+    stream_id_t id = next_client_stream_id_;
+    next_client_stream_id_ += 2;
+    return id;
 }
 
 
 // --- Frame Sending API Implementations ---
 
 bool Http2Connection::send_settings(const std::vector<SettingsFrame::Setting>& settings) {
-    if (!on_send_bytes_) return false; // Cannot send if no output callback
-
     SettingsFrame sf;
-    sf.header.type = FrameType::SETTINGS;
-    sf.header.flags = 0; // ACK is only for responding to peer's SETTINGS
-    sf.header.stream_id = 0;
     sf.settings = settings;
-    // Length will be calculated by serializer
-
-    // Before sending, apply these settings to our local_settings_ if they represent a change
-    // that affects our behavior or what we advertise.
-    // For example, if we change SETTINGS_HEADER_TABLE_SIZE, our HpackEncoder should know.
-    for(const auto& setting : settings) {
-        // This is a simplified application. A real implementation might differentiate
-        // between settings we *advertise* vs settings that *affect our immediate behavior*.
-        // For now, assume these are settings we are advertising.
-        // The Http2Connection::apply_local_setting is more for this.
-        // Let's assume the caller has already updated local_settings_ if needed,
-        // or these settings are purely for the peer.
-        // If we change our own SETTINGS_HEADER_TABLE_SIZE, hpack_encoder_ must be updated.
-        if (setting.identifier == SettingsFrame::SETTINGS_HEADER_TABLE_SIZE) {
-            if (hpack_encoder_.set_own_max_dynamic_table_size(setting.value)) {
-                // The encoder itself doesn't send an HPACK dynamic table update instruction here.
-                // That instruction is prefixed to a header block if needed.
-                // This method just updates the encoder's internal max size.
-            }
-        }
-        // Other settings might update local_settings_ fields directly.
-        // Example: local_settings_.max_concurrent_streams = ...; (if we are setting it)
-    }
-
-
     auto frame_bytes = FrameSerializer::serialize_settings_frame(sf);
-    if (frame_bytes.empty() && !sf.settings.empty() && !sf.has_ack_flag()) { // Serialization error only if actual payload expected
-        return false;
+    if(on_send_bytes_) {
+        on_send_bytes_(frame_bytes);
     }
-    on_send_bytes_(std::move(frame_bytes));
     return true;
 }
 
@@ -978,11 +865,7 @@ bool Http2Connection::send_window_update_action(stream_id_t stream_id, uint32_t 
                                                 // consumed data, freeing up *our* receive buffer for the *peer*.
                                                 // So, this action *increases* the window for the *peer to send to us*.
                                                 // The `local_connection_window_size_` is *our* receive window.
-                                                // This needs to be called when our app consumes data.
-                                                // The `increment` here is what we are *telling the peer* they can send more.
-                                                // This function is an *action* to send the frame.
-                                                // The actual update to `local_connection_window_size_`
-                                                // should happen when *our application* signals it has processed data.
+                                                // This needs to be called when *our application* signals it has processed data.
                                                 // For now, let's assume this function is called *after* such processing.
     } else {
         Http2Stream* stream = get_stream(stream_id);
@@ -1091,48 +974,26 @@ bool Http2Connection::send_headers(stream_id_t stream_id,
                                  const std::vector<HttpHeader>& headers,
                                  bool end_stream,
                                  std::optional<PriorityData> priority,
-                                 std::optional<uint8_t> padding_length) {
-    if (stream_id == 0 && !is_server_) {
-        // Client cannot initiate stream 0 with HEADERS. Server sends PUSH_PROMISE on even streams.
-        // This check might be too simple. HEADERS are usually for new client streams or responses.
-        return false;
-    }
-    if (!on_send_bytes_) return false;
-
-    Http2Stream* stream = get_stream(stream_id);
-    if (!stream) { // New stream
-        if (is_server_) { // Server cannot unilaterally open new streams with HEADERS (except for PUSH_PROMISE)
-            return false;
+                                 std::optional<uint8_t> padding) {
+    if (!is_server_) { // Is a client
+        if ((stream_id % 2) == 0 || stream_id < next_client_stream_id_) { // Stream ID must be odd and increasing
+            return false; // PROTOCOL_ERROR
         }
-        // Client is opening a new stream
-        if ((stream_id % 2) == 0 || stream_id < next_client_stream_id_to_offer_) { // Stream ID must be odd and increasing
-             return false; // Invalid client stream ID
-        }
-        stream = &get_or_create_stream(stream_id); // Creates and transitions to IDLE
-        next_client_stream_id_to_offer_ = stream_id + 2;
+        next_client_stream_id_ = stream_id + 2;
     }
 
-    // State checks:
-    // Client: IDLE -> OPEN (sending initial HEADERS)
-    // Server: RESERVED_REMOTE -> HALF_CLOSED_LOCAL (sending HEADERS for PUSH_PROMISE response)
-    // Both: OPEN or HALF_CLOSED_LOCAL -> send HEADERS (e.g. trailers)
-    if (is_server_) {
-        if (stream->get_state() != StreamState::OPEN && stream->get_state() != StreamState::RESERVED_REMOTE && stream->get_state() != StreamState::HALF_CLOSED_LOCAL) {
-            return false;
-        }
-    } else { // Client
-        if (stream->get_state() != StreamState::IDLE && stream->get_state() != StreamState::OPEN && stream->get_state() != StreamState::HALF_CLOSED_LOCAL) {
-            return false;
-        }
+    // Create stream
+    auto& stream = get_or_create_stream(stream_id);
+    if (stream.get_state() == StreamState::CLOSED) {
+        return false; // Cannot send HEADERS on a closed stream
     }
-
 
     FrameHeader initial_header;
     initial_header.type = FrameType::HEADERS;
     initial_header.stream_id = stream_id;
     initial_header.flags = 0;
     if (end_stream) initial_header.flags |= HeadersFrame::END_STREAM_FLAG;
-    if (padding_length.has_value()) initial_header.flags |= HeadersFrame::PADDED_FLAG;
+    if (padding.has_value()) initial_header.flags |= HeadersFrame::PADDED_FLAG;
     if (priority.has_value()) initial_header.flags |= HeadersFrame::PRIORITY_FLAG;
     // END_HEADERS will be set by serialize_header_block_with_continuation on the last frame.
 
@@ -1140,7 +1001,7 @@ bool Http2Connection::send_headers(stream_id_t stream_id,
     // The serializer helper will use parts of this.
     HeadersFrame hf_template; // Template for priority/padding data for the first frame.
     hf_template.header = initial_header; // Base flags, stream_id, type. Length is TBD by serializer.
-    if (padding_length.has_value()) hf_template.pad_length = padding_length.value();
+    if (padding.has_value()) hf_template.pad_length = padding.value();
     if (priority.has_value()) {
         hf_template.exclusive_dependency = priority.value().exclusive_dependency;
         hf_template.stream_dependency = priority.value().stream_dependency;
@@ -1164,14 +1025,14 @@ bool Http2Connection::send_headers(stream_id_t stream_id,
     }
 
     // Update stream state
-    if (stream->get_state() == StreamState::IDLE) { // Client sending initial HEADERS
-        stream->transition_to_open();
-    } else if (is_server_ && stream->get_state() == StreamState::RESERVED_REMOTE) { // Server responding to PUSH_PROMISE
-        stream->transition_to_half_closed_local();
+    if (stream.get_state() == StreamState::IDLE) { // Client sending initial HEADERS
+        stream.transition_to_open();
+    } else if (is_server_ && stream.get_state() == StreamState::RESERVED_REMOTE) { // Server responding to PUSH_PROMISE
+        stream.transition_to_half_closed_local();
     }
 
     if (end_stream) {
-        stream->transition_to_half_closed_local();
+        stream.transition_to_half_closed_local();
     }
     return true;
 }
@@ -1263,5 +1124,48 @@ bool Http2Connection::send_push_promise(stream_id_t associated_stream_id,
     return true;
 }
 
+void Http2Connection::apply_local_setting(const SettingsFrame::Setting& setting) {
+    // Apply a setting for our local configuration. This influences frames we send.
+    // This is simpler than apply_remote_setting as it doesn't usually trigger
+    // complex state changes like adjusting all stream windows.
+
+    switch (setting.identifier) {
+        case SettingsFrame::SETTINGS_HEADER_TABLE_SIZE:
+            local_settings_.header_table_size = setting.value;
+            // We should also inform our own HPACK encoder about this change.
+            hpack_encoder_.set_own_max_dynamic_table_size(setting.value);
+            break;
+        case SettingsFrame::SETTINGS_ENABLE_PUSH:
+            // This is a setting for the peer. A client sends this to a server.
+            // If we are a client, we'd set this. If we are a server, we'd read it.
+            if (!is_server_) {
+                local_settings_.enable_push = (setting.value != 0);
+            }
+            break;
+        case SettingsFrame::SETTINGS_MAX_CONCURRENT_STREAMS:
+            local_settings_.max_concurrent_streams = setting.value;
+            break;
+        case SettingsFrame::SETTINGS_INITIAL_WINDOW_SIZE:
+            if (setting.value > MAX_ALLOWED_WINDOW_SIZE) {
+                // This is an internal configuration error, should not happen in valid usage.
+                return;
+            }
+            // Changing our own initial window size setting will affect new streams we create.
+            local_settings_.initial_window_size = setting.value;
+            break;
+        case SettingsFrame::SETTINGS_MAX_FRAME_SIZE:
+            if (setting.value < DEFAULT_MAX_FRAME_SIZE || setting.value > MAX_ALLOWED_FRAME_SIZE) {
+                return; // Invalid configuration
+            }
+            local_settings_.max_frame_size = setting.value;
+            break;
+        case SettingsFrame::SETTINGS_MAX_HEADER_LIST_SIZE:
+            local_settings_.max_header_list_size = setting.value;
+            break;
+        default:
+            // Ignore unknown settings
+            break;
+    }
+}
 
 } // namespace http2

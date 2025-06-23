@@ -1,12 +1,22 @@
 #include "gtest/gtest.h"
-#include "cpp_lib/http2_connection.h"
-#include "cpp_lib/http2_frame.h" // For constructing test frames
-#include "cpp_lib/http2_parser.h" // For ParserError enum if needed
+#include "http2_connection.h"
+#include "http2_frame.h" // For constructing test frames
+#include "http2_parser.h" // For ParserError enum if needed
 #include <vector>
 #include <cstring> // for memcpy
-
+#include <numeric>
+#include "http2_frame_serializer.h"
 
 using namespace http2;
+
+// Helper function to create a vector of HttpHeader for tests
+std::vector<HttpHeader> make_headers_for_test(const std::vector<std::pair<std::string, std::string>>& headers) {
+    std::vector<HttpHeader> result;
+    for (const auto& p : headers) {
+        result.push_back({p.first, p.second});
+    }
+    return result;
+}
 
 // Helper to construct frame bytes (copied from test_http2_parser.cpp for convenience)
 std::vector<std::byte> construct_frame_bytes(uint32_t length, FrameType type, uint8_t flags, uint32_t stream_id, const std::vector<std::byte>& payload) {
@@ -26,7 +36,6 @@ std::vector<std::byte> construct_frame_bytes(uint32_t length, FrameType type, ui
     return frame_bytes;
 }
 
-
 class Http2ConnectionTest : public ::testing::Test {
 protected:
     // Use a client connection for some tests, server for others if behavior differs.
@@ -37,7 +46,10 @@ protected:
     std::vector<AnyHttp2Frame> received_frames_server;
     bool settings_ack_received_client = false;
     bool settings_ack_received_server = false;
-    // Add more state for callbacks as needed
+    // For capturing sent raw bytes
+    std::vector<std::vector<std::byte>> on_send_bytes_data;
+    // For capturing sent GOAWAY frames
+    std::vector<std::tuple<stream_id_t, ErrorCode, std::string>> on_send_goaway_data;
 
     Http2ConnectionTest() : client_conn(false /*is_server*/), server_conn(true /*is_server*/) {
         client_conn.set_frame_callback([this](const AnyHttp2Frame& frame){
@@ -45,6 +57,13 @@ protected:
         });
         client_conn.set_settings_ack_callback([this](){
             settings_ack_received_client = true;
+        });
+
+        client_conn.set_on_send_bytes([this](std::vector<std::byte> bytes){
+            on_send_bytes_data.push_back(std::move(bytes));
+        });
+         client_conn.set_on_send_goaway([this](stream_id_t sid, ErrorCode ec, const std::string& msg){
+            on_send_goaway_data.emplace_back(sid, ec, msg);
         });
 
         server_conn.set_frame_callback([this](const AnyHttp2Frame& frame){
@@ -60,6 +79,8 @@ protected:
         received_frames_server.clear();
         settings_ack_received_client = false;
         settings_ack_received_server = false;
+        on_send_bytes_data.clear();
+        on_send_goaway_data.clear();
         // Reset connection states if necessary (though constructor does a lot)
         // Re-creating connections or having a dedicated reset method might be better for full isolation.
     }
@@ -79,8 +100,8 @@ TEST_F(Http2ConnectionTest, ProcessSettingsFrameAndAck) {
     // Client sends: MAX_CONCURRENT_STREAMS (0x3) = 50
     //               HEADER_TABLE_SIZE (0x1) = 2048
     std::vector<std::byte> settings_payload = {
-        0x00, 0x03, 0x00, 0x00, 0x00, 0x32, // MAX_CONCURRENT_STREAMS = 50
-        0x00, 0x01, 0x00, 0x00, 0x08, 0x00  // HEADER_TABLE_SIZE = 2048
+        std::byte(0x00), std::byte(0x03), std::byte(0x00), std::byte(0x00), std::byte(0x00), std::byte(0x32), // MAX_CONCURRENT_STREAMS = 50
+        std::byte(0x00), std::byte(0x01), std::byte(0x00), std::byte(0x00), std::byte(0x08), std::byte(0x00)  // HEADER_TABLE_SIZE = 2048
     };
     auto frame_bytes = construct_frame_bytes(static_cast<uint32_t>(settings_payload.size()), FrameType::SETTINGS, 0, 0, settings_payload);
 
@@ -121,7 +142,7 @@ TEST_F(Http2ConnectionTest, StreamCreationAndDataFrameHandling) {
     EXPECT_EQ(stream1_server->get_id(), 1u);
 
     // Client sends DATA on Stream 1 (payload "hello", END_STREAM)
-    std::vector<std::byte> data_payload = {'h', 'e', 'l', 'l', 'o'};
+    std::vector<std::byte> data_payload = {std::byte('h'), std::byte('e'), std::byte('l'), std::byte('l'), std::byte('o')};
     auto data_frame = construct_frame_bytes(static_cast<uint32_t>(data_payload.size()),
                                           FrameType::DATA, DataFrame::END_STREAM_FLAG, 1, data_payload);
     server_conn.process_incoming_data(data_frame);
@@ -148,7 +169,7 @@ TEST_F(Http2ConnectionTest, RstStreamClosesStream) {
     ASSERT_EQ(stream1_server->get_state(), StreamState::OPEN);
 
     // Client sends RST_STREAM on Stream 1
-    std::vector<std::byte> rst_payload = {0x00, 0x00, 0x00, 0x08}; // CANCEL (0x8)
+    std::vector<std::byte> rst_payload = {std::byte(0x00), std::byte(0x00), std::byte(0x00), std::byte(0x08)}; // CANCEL (0x8)
     auto rst_frame = construct_frame_bytes(rst_payload.size(), FrameType::RST_STREAM, 0, 1, rst_payload);
     server_conn.process_incoming_data(rst_frame);
 
@@ -170,7 +191,7 @@ TEST_F(Http2ConnectionTest, WindowUpdateConnectionLevel) {
 
     // Server sends WINDOW_UPDATE for connection (stream 0)
     uint32_t increment = 1000;
-    std::vector<std::byte> wu_payload = {0x00, 0x00, 0x03, 0xE8}; // Increment 1000
+    std::vector<std::byte> wu_payload = {std::byte(0x00), std::byte(0x00), std::byte(0x03), std::byte(0xE8)}; // Increment 1000
     auto wu_frame = construct_frame_bytes(wu_payload.size(), FrameType::WINDOW_UPDATE, 0, 0, wu_payload);
 
     client_conn.process_incoming_data(wu_frame);
@@ -189,7 +210,7 @@ TEST_F(Http2ConnectionTest, WindowUpdateStreamLevel) {
 
     // Client sends WINDOW_UPDATE for stream 1
     uint32_t increment = 500;
-    std::vector<std::byte> wu_payload = {0x00, 0x00, 0x01, (std::byte)0xF4}; // Increment 500
+    std::vector<std::byte> wu_payload = {std::byte(0x00), std::byte(0x00), std::byte(0x01), std::byte(0xF4)}; // Increment 500
     auto wu_frame = construct_frame_bytes(wu_payload.size(), FrameType::WINDOW_UPDATE, 0, 1, wu_payload);
 
     server_conn.process_incoming_data(wu_frame);
@@ -233,7 +254,7 @@ TEST_F(Http2ConnectionTest, GoAwayProcessing) {
     // Server sends GOAWAY to client
     uint32_t last_stream_id = 5;
     ErrorCode error_code = ErrorCode::NO_ERROR;
-    std::vector<std::byte> debug_data_payload = {'b', 'y', 'e'};
+    std::vector<std::byte> debug_data_payload = {std::byte('b'), std::byte('y'), std::byte('e')};
 
     std::vector<std::byte> goaway_payload;
     goaway_payload.push_back(static_cast<std::byte>((last_stream_id >> 24) & 0xFF));
@@ -398,7 +419,9 @@ TEST_F(Http2ConnectionTest, SendDataFrameRespectsFlowControl) {
 
     // Try to send 12 bytes of data. Should be split into 3 frames (5, 5, 2).
     std::vector<std::byte> data_to_send(12);
-    std::iota(data_to_send.begin(), data_to_send.end(), std::byte(1));
+    for(size_t i = 0; i < data_to_send.size(); ++i) {
+        data_to_send[i] = static_cast<std::byte>(i+1);
+    }
 
     // Ensure server has enough window from client (for this test, assume large enough)
     // To test this properly, we'd need to simulate client sending WINDOW_UPDATE.
@@ -432,7 +455,7 @@ TEST_F(Http2ConnectionTest, SendHeadersWithContinuation) {
     });
 
     // Set peer's (server for client_conn) max_frame_size to be small
-    client_conn.remote_settings_.max_frame_size = 30;
+    client_conn.apply_remote_setting({SettingsFrame::SETTINGS_MAX_FRAME_SIZE, 30});
 
     std::string long_val(50, 'b');
     std::vector<HttpHeader> headers = {
@@ -501,7 +524,7 @@ TEST_F(Http2ConnectionTest, SendRstStreamFrameAction) {
     });
 
     // Open a stream first to make RST meaningful for state change
-    client_conn.send_headers(1, make_headers_fs({{":method", "GET"}}), false);
+    client_conn.send_headers(1, make_headers_for_test({{":method", "GET"}}), false);
     sent_frames_capture.clear(); // Clear headers frame
 
     Http2Stream* stream1 = client_conn.get_stream(1);
@@ -531,7 +554,9 @@ TEST_F(Http2ConnectionTest, SendPingAckAction) {
     });
 
     PingFrame received_ping; // Simulate a received PING
-    std::iota(received_ping.opaque_data.begin(), received_ping.opaque_data.end(), std::byte(1));
+    for(size_t i=0; i<received_ping.opaque_data.size(); ++i) {
+        received_ping.opaque_data[i] = static_cast<std::byte>(i+1);
+    }
 
     bool success = client_conn.send_ping_ack_action(received_ping);
     EXPECT_TRUE(success);
@@ -590,7 +615,7 @@ TEST_F(Http2ConnectionTest, SendWindowUpdateAction) {
     sent_frames_capture.clear();
 
     // For a specific stream
-    client_conn.send_headers(1, make_headers_fs({{":method", "GET"}}), false); // Open stream 1
+    client_conn.send_headers(1, make_headers_for_test({{":method", "GET"}}), false); // Open stream 1
     sent_frames_capture.clear();
     bool success_stream = client_conn.send_window_update_action(1, 5000);
     EXPECT_TRUE(success_stream);
@@ -617,7 +642,7 @@ TEST_F(Http2ConnectionTest, SendPushPromiseFrame) {
 
     stream_id_t associated_stream_id = 1;
     stream_id_t promised_stream_id = 2; // Server promises an even stream
-    std::vector<HttpHeader> headers = make_headers_fs({{":method", "GET"}, {":path", "/promised.js"}});
+    std::vector<HttpHeader> headers = make_headers_for_test({{":method", "GET"}, {":path", "/promised.js"}});
     // HPACK for :method:GET (82), :path:/promised.js (44 + len + path_val)
     // :path:/promised.js -> 44 0c 2f70726f6d697365642e6a73 (idx 4, literal len 12)
     // HPACK payload: 82 44 0c 2f70726f6d697365642e6a73  (1 + 1+1+12 = 15 bytes)
@@ -643,11 +668,159 @@ TEST_F(Http2ConnectionTest, SendPushPromiseFrame) {
     EXPECT_EQ(promised_stream->get_state(), StreamState::RESERVED_LOCAL);
 }
 
+TEST_F(Http2ConnectionTest, FlowControlSendData) {
+    uint32_t initial_window = 20;
+    client_conn.apply_remote_setting({SettingsFrame::SETTINGS_INITIAL_WINDOW_SIZE, initial_window});
+    server_conn.apply_local_setting({SettingsFrame::SETTINGS_INITIAL_WINDOW_SIZE, initial_window});
 
-// TODO: Test flow control error scenarios (sending too much data)
-// TODO: Test SETTINGS_INITIAL_WINDOW_SIZE change affecting existing stream windows
-// TODO: Test MAX_CONCURRENT_STREAMS limit (requires sending frames from connection)
-// TODO: Test PUSH_PROMISE scenarios (client receiving, server sending)
+    // Open stream 1
+    client_conn.send_headers(1, make_headers_for_test({{":method", "GET"}}), false);
+    // process the output
+    auto sent_bytes = on_send_bytes_data.front();
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+    server_conn.process_incoming_data(sent_bytes);
+
+
+    // Try to send 30 bytes, but window is 20
+    std::vector<std::byte> data_to_send(30);
+    for(size_t i = 0; i < data_to_send.size(); ++i) {
+        data_to_send[i] = std::byte(i+1);
+    }
+
+    bool result = client_conn.send_data(1, data_to_send, false);
+    EXPECT_TRUE(result); // Should succeed in sending a partial frame
+
+    // We expect a DATA frame of size 20 to be sent
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    auto sent_data_frame_bytes = on_send_bytes_data.front();
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+
+    HpackDecoder hpack_decoder; // dummy decoder
+    Http2Parser parser(hpack_decoder, client_conn); // Use a temporary parser to inspect the frame
+    parser.parse(sent_data_frame_bytes);
+
+    // This part requires a callback mechanism from the parser to get the frame.
+    // For now, let's just check the length.
+    // Frame header is 9 bytes. Payload is 20. Total 29.
+    EXPECT_EQ(sent_data_frame_bytes.size(), 9u + initial_window);
+
+    // Verify stream's send window is now 0
+    EXPECT_EQ(client_conn.get_stream(1)->get_remote_window_size(), 0);
+}
+
+TEST_F(Http2ConnectionTest, FrameSizeLimit) {
+    client_conn.apply_remote_setting({SettingsFrame::SETTINGS_MAX_FRAME_SIZE, 30});
+
+    // Send headers that will NOT be fragmented
+    client_conn.send_headers(1, make_headers_for_test({{":method", "GET"}}), false);
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    auto sent_bytes = on_send_bytes_data.front();
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+
+    // Send a DATA frame that is too large
+    std::vector<std::byte> oversized_data(31);
+    bool result = client_conn.send_data(1, oversized_data, false);
+    EXPECT_FALSE(result); // Should fail because payload exceeds max frame size
+
+    // Send a DATA frame that is exactly the max size
+    std::vector<std::byte> max_sized_data(30);
+    result = client_conn.send_data(1, max_sized_data, false);
+    EXPECT_TRUE(result); // Should succeed
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    sent_bytes = on_send_bytes_data.front();
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+    // process this on server side
+    server_conn.process_incoming_data(sent_bytes);
+    on_send_bytes_data.erase(on_send_bytes_data.begin()); // ACK
+}
+
+TEST_F(Http2ConnectionTest, PingAndAck) {
+    std::array<std::byte, 8> ping_data;
+    for(size_t i = 0; i < ping_data.size(); ++i) {
+        ping_data[i] = std::byte(i+1);
+    }
+
+    client_conn.send_ping(ping_data, false);
+
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    auto sent_bytes = on_send_bytes_data.front();
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+
+    // Server receives PING
+    PingFrame received_ping;
+    server_conn.set_ping_ack_callback([&](const PingFrame& pf) {
+        received_ping = pf;
+    });
+
+    server_conn.set_on_send_ping_ack([&](const PingFrame& pf) {
+        // This lambda will be called by the connection to "send" a ping ack
+        auto serialized_frame = http2::FrameSerializer::serialize_ping_frame(pf);
+        client_conn.process_incoming_data(serialized_frame);
+    });
+
+    server_conn.process_incoming_data(sent_bytes);
+
+    // Check that the server correctly identifies the ping data and sends an ACK
+    // The ACK is automatically sent back to the client_conn inside the test setup
+    std::vector<std::byte> expected_ping_data(8);
+    for(size_t i = 0; i < expected_ping_data.size(); ++i) {
+        expected_ping_data[i] = std::byte(i+1);
+    }
+    EXPECT_EQ(memcmp(received_ping.opaque_data.data(), expected_ping_data.data(), 8), 0);
+}
+
+TEST_F(Http2ConnectionTest, GoAwaySentOnRstStreamForIdleStream) {
+    bool goaway_sent = false;
+    client_conn.set_on_send_goaway([&](auto...){ goaway_sent = true; });
+
+    // Stream 1 is idle. Sending a RST_STREAM for it is a connection error.
+    client_conn.send_rst_stream_frame_action(1, ErrorCode::STREAM_CLOSED);
+    EXPECT_TRUE(goaway_sent);
+}
+
+TEST_F(Http2ConnectionTest, SendHeadersAndData) {
+    client_conn.send_headers(1, make_headers_for_test({{":method", "POST"}}), false);
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    server_conn.process_incoming_data(on_send_bytes_data.front());
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+
+    EXPECT_NE(server_conn.get_stream(1), nullptr);
+    EXPECT_EQ(server_conn.get_stream(1)->get_state(), StreamState::OPEN);
+
+    std::vector<std::byte> data_payload(100, std::byte('d'));
+    client_conn.send_data(1, data_payload, true);
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    server_conn.process_incoming_data(on_send_bytes_data.front());
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+
+    EXPECT_EQ(server_conn.get_stream(1)->get_state(), StreamState::HALF_CLOSED_LOCAL);
+}
+
+TEST_F(Http2ConnectionTest, PushPromise) {
+    // Client sends request
+    client_conn.send_headers(1, make_headers_for_test({{":path", "/"}}), true);
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    server_conn.process_incoming_data(on_send_bytes_data.front());
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+
+    // Server sends PUSH_PROMISE for stream 2 associated with stream 1
+    std::vector<HttpHeader> promise_headers = {{":path", "/style.css"}};
+    server_conn.send_push_promise(1, 2, promise_headers);
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    client_conn.process_incoming_data(on_send_bytes_data.front());
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+
+    auto* promised_stream = client_conn.get_stream(2);
+    ASSERT_NE(promised_stream, nullptr);
+    EXPECT_EQ(promised_stream->get_state(), StreamState::RESERVED_REMOTE);
+
+    // Server sends HEADERS for the promised stream
+    server_conn.send_headers(2, {{":status", "200"}}, true);
+    ASSERT_FALSE(on_send_bytes_data.empty());
+    client_conn.process_incoming_data(on_send_bytes_data.front());
+    on_send_bytes_data.erase(on_send_bytes_data.begin());
+    EXPECT_EQ(promised_stream->get_state(), StreamState::CLOSED);
+}
 
 // Main is in test_hpack_decoder.cpp or test_http2_parser.cpp
 // int main(int argc, char **argv) {

@@ -252,10 +252,10 @@ std::pair<std::string, HpackError> HpackDecoder::decode_string(std::span<const s
 
 
 void HpackDecoder::add_to_dynamic_table(HttpHeader header) {
-    size_t entry_size = header.name.length() + header.value.length() + 32; // As per RFC 7541 Section 4.1
+    size_t entry_size = header.name.length() + header.value.length() + 32;
 
     if (entry_size > max_dynamic_table_size_) {
-        // Entry is too large to ever fit, clear the table
+        // Entry is larger than the entire table capacity, so just clear the table.
         dynamic_table_.clear();
         current_dynamic_table_size_ = 0;
         return;
@@ -263,7 +263,7 @@ void HpackDecoder::add_to_dynamic_table(HttpHeader header) {
 
     evict_from_dynamic_table(static_cast<uint32_t>(entry_size));
 
-    dynamic_table_.push_front({std::move(header.name), std::move(header.value), entry_size});
+    dynamic_table_.push_front(DynamicTableEntry(std::move(header.name), std::move(header.value)));
     current_dynamic_table_size_ += static_cast<uint32_t>(entry_size);
 }
 

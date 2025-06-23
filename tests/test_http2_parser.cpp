@@ -1,7 +1,7 @@
 #include "gtest/gtest.h"
-#include "cpp_lib/http2_parser.h"
-#include "cpp_lib/http2_connection.h" // Parser needs connection context
-#include "cpp_lib/hpack_decoder.h"    // Parser needs hpack decoder
+#include "http2_parser.h"
+#include "http2_connection.h"
+#include "hpack_decoder.h"    // Parser needs hpack decoder
 #include <vector>
 #include <cstring> // for memcpy
 
@@ -44,9 +44,9 @@ protected:
         parser.set_raw_frame_parsed_callback([this](AnyHttp2Frame frame){
             parsed_frames_store.push_back(std::move(frame));
         });
-        // Set a reasonable max frame size for tests, e.g. default
-        connection_context.local_settings_.max_frame_size = DEFAULT_MAX_FRAME_SIZE;
-        connection_context.remote_settings_.max_frame_size = DEFAULT_MAX_FRAME_SIZE;
+        // Set a reasonable max frame size for tests, e.g., default
+        connection_context.apply_local_setting({http2::SettingsFrame::SETTINGS_MAX_FRAME_SIZE, DEFAULT_MAX_FRAME_SIZE});
+        connection_context.apply_remote_setting({http2::SettingsFrame::SETTINGS_MAX_FRAME_SIZE, DEFAULT_MAX_FRAME_SIZE});
     }
 
     void SetUp() override {
@@ -66,7 +66,7 @@ protected:
 };
 
 TEST_F(Http2ParserTest, ParseDataFrameSimple) {
-    std::vector<std::byte> payload = {'h', 'e', 'l', 'l', 'o'};
+    std::vector<std::byte> payload = {std::byte('h'), std::byte('e'), std::byte('l'), std::byte('l'), std::byte('o')};
     uint32_t stream_id = 1;
     uint8_t flags = DataFrame::END_STREAM_FLAG;
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::DATA, flags, stream_id, payload);
@@ -90,7 +90,7 @@ TEST_F(Http2ParserTest, ParseDataFrameSimple) {
 }
 
 TEST_F(Http2ParserTest, ParseDataFrameWithPadding) {
-    std::vector<std::byte> actual_data = {'h', 'i'};
+    std::vector<std::byte> actual_data = {std::byte('h'), std::byte('i')};
     uint8_t pad_length = 5;
     std::vector<std::byte> payload;
     payload.push_back(static_cast<std::byte>(pad_length)); // Pad Length field
@@ -120,8 +120,8 @@ TEST_F(Http2ParserTest, ParseSettingsFrame) {
     // Setting: MAX_CONCURRENT_STREAMS (0x3) = 100 (0x64)
     // Setting: INITIAL_WINDOW_SIZE (0x4) = 65536 (0x10000)
     std::vector<std::byte> payload = {
-        0x00, 0x03, 0x00, 0x00, 0x00, 0x64, // MAX_CONCURRENT_STREAMS = 100
-        0x00, 0x04, 0x00, 0x01, 0x00, 0x00  // INITIAL_WINDOW_SIZE = 65536
+        std::byte(0x00), std::byte(0x03), std::byte(0x00), std::byte(0x00), std::byte(0x00), std::byte(0x64), // MAX_CONCURRENT_STREAMS = 100
+        std::byte(0x00), std::byte(0x04), std::byte(0x00), std::byte(0x01), std::byte(0x00), std::byte(0x00)  // INITIAL_WINDOW_SIZE = 65536
     };
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::SETTINGS, 0, 0, payload);
 
@@ -167,7 +167,7 @@ TEST_F(Http2ParserTest, ParsePingFrame) {
 }
 
 TEST_F(Http2ParserTest, ParseWindowUpdateFrame) {
-    std::vector<std::byte> payload = {0x00, 0x0F, 0x42, 0x40}; // Increment = 1000000
+    std::vector<std::byte> payload = {std::byte(0x00), std::byte(0x0F), std::byte(0x42), std::byte(0x40)}; // Increment = 1000000
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::WINDOW_UPDATE, 0, 1, payload);
     feed_parser(frame_bytes);
     ASSERT_EQ(last_parser_error_, ParserError::OK);
@@ -281,16 +281,17 @@ TEST_F(Http2ParserTest, ParseContinuationFrames) {
 
 
 TEST_F(Http2ParserTest, ErrorFrameSizeExceeded) {
-    connection_context.remote_settings_.max_frame_size = 10; // Small max frame size
-    std::vector<std::byte> payload(11, static_cast<std::byte>('A')); // Payload is 11 bytes > 10
+    connection_context.apply_remote_setting({http2::SettingsFrame::SETTINGS_MAX_FRAME_SIZE, 10}); // Small max frame size
+    
+    std::vector<std::byte> payload(11, std::byte('A')); // Payload is 11 bytes > 10
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::DATA, 0, 1, {}); // Payload not actually sent here
                                                                                                         // The header declares length 11.
 
     // Create frame header declaring length 11
     std::vector<std::byte> oversized_header_bytes = {
-        0x00, 0x00, 0x0B, // Length 11
-        (std::byte)FrameType::DATA, 0x00,
-        0x00, 0x00, 0x00, 0x01 // Stream 1
+        std::byte(0x00), std::byte(0x00), std::byte(0x0B), // Length 11
+        std::byte(FrameType::DATA), std::byte(0x00),
+        std::byte(0x00), std::byte(0x00), std::byte(0x00), std::byte(0x01) // Stream 1
     };
     // We don't even need to send payload, header itself is the problem.
     feed_parser(oversized_header_bytes);
@@ -300,7 +301,7 @@ TEST_F(Http2ParserTest, ErrorFrameSizeExceeded) {
 
 
 TEST_F(Http2ParserTest, PartialFrameThenComplete) {
-    std::vector<std::byte> payload = {'h', 'e', 'l', 'l', 'o'};
+    std::vector<std::byte> payload = {std::byte('h'), std::byte('e'), std::byte('l'), std::byte('l'), std::byte('o')};
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::DATA, 0, 1, payload);
 
     // Feed only first 5 bytes (incomplete header)
@@ -318,9 +319,9 @@ TEST_F(Http2ParserTest, PartialFrameThenComplete) {
 }
 
 TEST_F(Http2ParserTest, TwoFramesConcatenated) {
-    std::vector<std::byte> payload1 = {'f', '1'};
+    std::vector<std::byte> payload1 = {std::byte('f'), std::byte('1')};
     auto frame1_bytes = construct_frame(static_cast<uint32_t>(payload1.size()), FrameType::DATA, 0, 1, payload1);
-    std::vector<std::byte> payload2 = {'f', '2', 'd'};
+    std::vector<std::byte> payload2 = {std::byte('f'), std::byte('2'), std::byte('d')};
     auto frame2_bytes = construct_frame(static_cast<uint32_t>(payload2.size()), FrameType::DATA, DataFrame::END_STREAM_FLAG, 1, payload2);
 
     std::vector<std::byte> all_bytes;
@@ -343,28 +344,28 @@ TEST_F(Http2ParserTest, TwoFramesConcatenated) {
 }
 
 TEST_F(Http2ParserTest, ErrorRstStreamInvalidLength) {
-    std::vector<std::byte> payload = {0x00, 0x00, 0x00, 0x01, 0x00}; // 5 bytes, expected 4
+    std::vector<std::byte> payload = {std::byte(0x00), std::byte(0x00), std::byte(0x00), std::byte(0x01), std::byte(0x00)}; // 5 bytes, expected 4
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::RST_STREAM, 0, 1, payload);
     feed_parser(frame_bytes);
     EXPECT_EQ(last_parser_error_, ParserError::INVALID_FRAME_SIZE);
 }
 
 TEST_F(Http2ParserTest, ErrorWindowUpdateInvalidLength) {
-    std::vector<std::byte> payload = {0x00, 0x00, 0x01}; // 3 bytes, expected 4
+    std::vector<std::byte> payload = {std::byte(0x00), std::byte(0x00), std::byte(0x01)}; // 3 bytes, expected 4
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::WINDOW_UPDATE, 0, 0, payload);
     feed_parser(frame_bytes);
     EXPECT_EQ(last_parser_error_, ParserError::INVALID_FRAME_SIZE);
 }
 
 TEST_F(Http2ParserTest, ErrorWindowUpdateZeroIncrement) {
-    std::vector<std::byte> payload = {0x00, 0x00, 0x00, 0x00}; // Increment 0
+    std::vector<std::byte> payload = {std::byte(0x00), std::byte(0x00), std::byte(0x00), std::byte(0x00)}; // Increment 0
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::WINDOW_UPDATE, 0, 1, payload);
     feed_parser(frame_bytes);
     EXPECT_EQ(last_parser_error_, ParserError::INVALID_WINDOW_UPDATE_INCREMENT);
 }
 
 TEST_F(Http2ParserTest, ErrorSettingsAckWithPayload) {
-    std::vector<std::byte> payload = {0x01}; // Payload length 1
+    std::vector<std::byte> payload = {std::byte(0x01)}; // Payload length 1
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::SETTINGS, SettingsFrame::ACK_FLAG, 0, payload);
     feed_parser(frame_bytes);
     EXPECT_EQ(last_parser_error_, ParserError::INVALID_FRAME_SIZE);
@@ -378,14 +379,14 @@ TEST_F(Http2ParserTest, ErrorSettingsInvalidLength) {
 }
 
 TEST_F(Http2ParserTest, ErrorDataFrameOnStreamZero) {
-    std::vector<std::byte> payload = {'a'};
+    std::vector<std::byte> payload = {std::byte('a')};
     auto frame_bytes = construct_frame(static_cast<uint32_t>(payload.size()), FrameType::DATA, 0, 0, payload);
     feed_parser(frame_bytes);
     EXPECT_EQ(last_parser_error_, ParserError::INVALID_STREAM_ID);
 }
 
 TEST_F(Http2ParserTest, ErrorHeadersFrameOnStreamZero) {
-    std::vector<std::byte> hpack_payload = {static_cast<std::byte>(0x82)}; // :method: GET
+    std::vector<std::byte> hpack_payload = {std::byte(0x82)}; // :method: GET
     auto frame_bytes = construct_frame(static_cast<uint32_t>(hpack_payload.size()), FrameType::HEADERS, HeadersFrame::END_HEADERS_FLAG, 0, hpack_payload);
     feed_parser(frame_bytes);
     EXPECT_EQ(last_parser_error_, ParserError::INVALID_STREAM_ID);

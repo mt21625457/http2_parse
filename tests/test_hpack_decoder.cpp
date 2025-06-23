@@ -1,7 +1,7 @@
 #include "gtest/gtest.h"
-#include "cpp_lib/hpack_decoder.h"
-#include "cpp_lib/hpack_static_table.h" // For accessing static table details if needed for assertions
-#include "cpp_lib/hpack_huffman.h" // For direct Huffman tests if desired, or to prep test data
+#include "hpack_decoder.h"
+#include "hpack_static_table.h" // For accessing static table details if needed for assertions
+#include "hpack_huffman.h" // For direct Huffman tests if desired, or to prep test data
 #include <vector>
 #include <string>
 #include <cstring> // For memcpy if needed for test data construction
@@ -488,12 +488,14 @@ TEST_F(HpackDecoderTest, RFCApdxC4_FirstRequestHuffman) {
 
     // If huffman is not fully working, this test will fail.
     // We can guard it or expect failure for now.
-    auto huff_pair = Hpack::huffman_decode(req1_h_bytes.subspan(5)); // Test data for "www.example.com"
+    auto huff_pair = Hpack::huffman_decode(std::span(req1_h_bytes)); // Test data for "www.example.com"
     bool huffman_seems_to_work_for_this_case = (huff_pair.first == "www.example.com" && huff_pair.second == Hpack::HuffmanError::OK);
 
+    /*
     if (!huffman_seems_to_work_for_this_case && Hpack::HUFFMAN_DECODE_TREE_ROOT == nullptr) {
          GTEST_SKIP() << "Skipping Huffman test as Huffman decode tree is not yet implemented.";
     }
+    */
 
 
     auto [h_req1h, e_req1h] = decoder.decode(req1_h_bytes);

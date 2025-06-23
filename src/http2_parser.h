@@ -90,6 +90,8 @@ private:
     // They return an AnyHttp2Frame or a ParserError.
     // In C++23, std::expected<AnyHttp2Frame, ParserError> would be ideal.
 
+    std::pair<AnyHttp2Frame, ParserError> parse_frame_payload(const FrameHeader& header, std::span<const std::byte> payload);
+
     std::pair<AnyHttp2Frame, ParserError> parse_data_payload(const FrameHeader& header, std::span<const std::byte> payload);
     std::pair<AnyHttp2Frame, ParserError> parse_headers_payload(const FrameHeader& header, std::span<const std::byte> payload);
     std::pair<AnyHttp2Frame, ParserError> parse_priority_payload(const FrameHeader& header, std::span<const std::byte> payload);
@@ -100,7 +102,7 @@ private:
     std::pair<AnyHttp2Frame, ParserError> parse_goaway_payload(const FrameHeader& header, std::span<const std::byte> payload);
     std::pair<AnyHttp2Frame, ParserError> parse_window_update_payload(const FrameHeader& header, std::span<const std::byte> payload);
     std::pair<AnyHttp2Frame, ParserError> parse_continuation_payload(const FrameHeader& header, std::span<const std::byte> payload);
-    // std::pair<AnyHttp2Frame, ParserError> parse_unknown_payload(const FrameHeader& header, std::span<const std::byte> payload);
+    std::pair<AnyHttp2Frame, ParserError> parse_unknown_payload(const FrameHeader& header, std::span<const std::byte> payload);
 
 
     // Helper to read the 9-byte frame header

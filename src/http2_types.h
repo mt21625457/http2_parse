@@ -12,6 +12,9 @@ namespace http2 {
 using stream_id_t = uint32_t;
 using window_size_t = uint32_t;
 
+// Maximum value for a stream ID (2^31 - 1)
+const stream_id_t MAX_STREAM_ID = 0x7FFFFFFF;
+
 // HTTP/2 Frame Types (RFC 7540 Section 11.2)
 enum class FrameType : uint8_t {
     DATA = 0x0,

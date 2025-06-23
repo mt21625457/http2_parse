@@ -1,10 +1,12 @@
 #include "gtest/gtest.h"
-#include "cpp_lib/hpack_encoder.h"
-#include "cpp_lib/hpack_static_table.h" // For checking against static table
-#include "cpp_lib/hpack_huffman.h"   // For huffman details
+#include "hpack_encoder.h"
+#include "hpack_static_table.h" // For checking against static table
+#include "hpack_huffman.h"   // For huffman details
 #include <vector>
 #include <string>
 #include <numeric> // for std::iota
+#include <sstream>
+#include <iomanip>
 
 using namespace http2;
 

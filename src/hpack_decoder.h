@@ -41,7 +41,7 @@ public:
     uint32_t get_max_dynamic_table_size() const;
 
 
-private:
+// private:
     struct DynamicTableEntry {
         std::string name;
         std::string value;

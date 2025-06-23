@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <optional> // C++17, consider std::expected for C++23 if available & chosen for error handling
+#include <variant>
 
 namespace http2 {
 
@@ -162,6 +163,11 @@ struct ContinuationFrame {
     bool has_end_headers_flag() const { return header.flags & END_HEADERS_FLAG; }
 };
 
+struct UnknownFrame {
+    FrameHeader header;
+    std::vector<std::byte> payload;
+};
+
 // A variant to hold any of the specific frame types
 using Http2FrameVariant = std::variant<
     DataFrame,
@@ -173,7 +179,8 @@ using Http2FrameVariant = std::variant<
     PingFrame,
     GoAwayFrame,
     WindowUpdateFrame,
-    ContinuationFrame
+    ContinuationFrame,
+    UnknownFrame
     // Potentially std::monostate if a default "empty" state is needed
     // or a specific "UnknownFrame" type for extensibility.
 >;

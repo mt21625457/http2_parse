@@ -3,6 +3,7 @@
 #include "http2_types.h" // For HttpHeader
 #include <vector>
 #include <string>
+#include <optional>
 
 namespace http2 {
 namespace Hpack {
